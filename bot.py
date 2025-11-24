@@ -3,53 +3,15 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 import database
-import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-
-# Initialize Gemini
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-2.5-flash')
-else:
-    model = None
-    print("⚠️ GEMINI_API_KEY not found. Title generation will be disabled.")
 
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
-
-
-async def generate_title(messages_content):
-    """Generate a short title for the given messages using Gemini."""
-    if not model:
-        return None
-    
-    try:
-        prompt = f"""You are a helpful assistant that creates concise, descriptive titles for conversations.
-
-Analyze the following conversation and create a short, specific title (maximum 5 words) that captures the main topic or theme.
-
-DO NOT use generic phrases like "Bot saves messages" or "Conversation summary".
-DO create a title that reflects the actual content being discussed.
-
-Conversation:
-{messages_content}
-
-Return ONLY the title, nothing else."""
-        
-        response = model.generate_content(prompt)
-        title = response.text.strip()
-        # Remove quotes if present
-        title = title.strip('"\'')
-        return title[:100]  # Limit to 100 chars
-    except Exception as e:
-        print(f"❌ Title generation failed: {e}")
-        return None
 
 @bot.event
 async def on_ready():
@@ -57,84 +19,11 @@ async def on_ready():
     # Initialize database
     await database.init_db()
 
-@bot.command(name='note')
-async def note(ctx, *args):
-    """
-    Saves a message or a conversation.
-    Usage:
-    - Reply to a message with !note to save it.
-    - !note 5 to save the last 5 messages.
-    - !note 5 3 to save messages from 5th last to 3rd last.
-    """
-    messages_to_save = []
-    
-    # Case 1: Reply to a message
-    if ctx.message.reference:
-        original_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-        messages_to_save = [(original_msg.content, str(original_msg.author))]
-        combined_content = f"{original_msg.author}: {original_msg.content}"
-
-    # Case 2: Save last N messages or Range N to M
-    elif args and all(arg.isdigit() for arg in args):
-        if len(args) == 1:
-            # !note 5
-            start = int(args[0])
-            end = 1
-        elif len(args) == 2:
-            # !note 5 3
-            start = int(args[0])
-            end = int(args[1])
-            if start < end:
-                await ctx.send("❌ Start number must be greater than end number (e.g., `!note 5 3`).")
-                return
-        else:
-             await ctx.send("❌ Invalid usage. Use `!note <N>` or `!note <Start> <End>`.")
-             return
-
-        limit = start + 1 # +1 to include command itself
-        messages = [message async for message in ctx.channel.history(limit=limit)]
-        
-        if len(messages) < limit:
-             # Handle case where history is shorter than requested
-             pass 
-
-        subset = messages[end : start + 1]
-        
-        # Prepare messages for saving
-        for msg in reversed(subset):
-            messages_to_save.append((msg.content, str(msg.author)))
-        
-        # Aggregate content for title generation
-        combined_content = "\n".join([f"{author}: {content}" for content, author in messages_to_save])
-    
-    else:
-        await ctx.send("❌ Please reply to a message, specify a number (e.g., `!note 5`), or a range (e.g., `!note 5 3`).")
-        return
-    
-    # Generate title
-    title = await generate_title(combined_content)
-    
-    # Save conversation
-    conversation_id = await database.save_conversation(
-        messages_to_save, 
-        title, 
-        ctx.channel.id, 
-        ctx.guild.id
-    )
-    
-    if conversation_id:
-        if title:
-            await ctx.send(f"✅ Saved {len(messages_to_save)} message(s)!\n📌 Title: *{title}*")
-        else:
-            await ctx.send(f"✅ Saved {len(messages_to_save)} message(s)!")
-    else:
-        await ctx.send("❌ Failed to save conversation.")
-
 # Store search results temporarily (per user)
 search_results_cache = {}
 
 @bot.command(name='search')
-async def search(ctx, *, query: str = None):
+async def search(ctx, *, query: str):
     """
     Searches saved conversations by keyword.
     Usage: !search <query>
@@ -155,12 +44,13 @@ async def search(ctx, *, query: str = None):
     # Build response with numbered list
     response = f"**🔍 Search Results for '{query}':**\n\n"
     for i, conv in enumerate(results, 1):
-        title = conv['title'] or "Untitled"
-        message_count = conv['message_count']
+        title = conv['title']
         created_at = conv['created_at']
+        message_link = conv['message_link']
         
-        response += f"{i}. **{title}** ({message_count} message{'s' if message_count != 1 else ''})\n"
-        response += f"   *Saved: {created_at}*\n\n"
+        response += f"{i}. **{title}**\n"
+        response += f"   *Saved: {created_at}*\n"
+        response += f"   🔗 [Jump to message]({message_link})\n\n"
     
     response += f"\n💡 Use `!show <number>` to view a conversation (e.g., `!show 1`)"
     
@@ -171,9 +61,9 @@ async def search(ctx, *, query: str = None):
     await ctx.send(response)
 
 @bot.command(name='show')
-async def show(ctx, number: int = None):
+async def show(ctx, number: int):
     """
-    Shows the full content of a conversation from search results.
+    Shows the link to a conversation from search results.
     Usage: !show <number>
     """
     if number is None:
@@ -193,33 +83,119 @@ async def show(ctx, number: int = None):
         return
     
     # Get the conversation
-    conv_id = results[number - 1]['id']
-    conversation = await database.get_conversation_by_id(conv_id)
-    
-    if not conversation:
-        await ctx.send("❌ Conversation not found.")
-        return
+    conv = results[number - 1]
     
     # Build response
-    title = conversation['title'] or "Untitled"
-    message_count = conversation['message_count']
-    created_at = conversation['created_at']
+    title = conv['title']
+    created_at = conv['created_at']
+    message_link = conv['message_link']
     
     response = f"**📌 {title}**\n"
-    response += f"*Saved: {created_at} • {message_count} message{'s' if message_count != 1 else ''}*\n\n"
-    response += "**Messages:**\n"
+    response += f"*Saved: {created_at}*\n"
+    response += f"🔗 [Jump to message]({message_link})"
     
-    for msg in conversation['messages']:
-        response += f"**{msg['author']}** ({msg['timestamp']}):\n"
-        response += f"{msg['content']}\n\n"
+    await ctx.send(response)
+
+@bot.command(name='save')
+async def save_topic(ctx, *, topic: str ):
+    """
+    Saves a conversation topic with a link.
+    Usage: 
+    - !save 'Topic title' <message_link> - Saves the topic with the provided link
+    - !save 'Topic title' - Saves the topic with a link to the current message
+    """
+    if not topic:
+        await ctx.send("❌ Please provide a topic. Usage: `!save 'Your topic here' <link>`")
+        return
     
-    # Split if too long (Discord has 2000 char limit)
-    if len(response) > 2000:
-        # Send in chunks
-        chunks = [response[i:i+1900] for i in range(0, len(response), 1900)]
-        for chunk in chunks:
-            await ctx.send(chunk)
+    # Extract text between quotes if present
+    import re
+    quote_match = re.search(r'["\'](.+?)["\']', topic)
+    title = quote_match.group(1) if quote_match else topic
+    
+    # Extract Discord message link from the input
+    link_pattern = r'https://discord\.com/channels/\d+/\d+/\d+'
+    link_match = re.search(link_pattern, topic)
+    
+    if link_match:
+        # User provided a link
+        message_link = link_match.group(0)
+    elif ctx.message.reference:
+        # Reply to a message - save that message link
+        original_message = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+        message_link = original_message.jump_url
     else:
+        # No link provided, use command message link
+        message_link = ctx.message.jump_url
+    
+    # Save to database with link
+    conversation_id = await database.save_conversation(
+        title,
+        ctx.channel.id,
+        ctx.guild.id,
+        message_link
+    )
+    
+    if conversation_id:
+        # Send confirmation in original channel
+        await ctx.send(
+            f"✅ Saved topic: **{title}**\n"
+            f"🔗 Link: {message_link}"
+        )
+    else:
+        await ctx.send("❌ Failed to save conversation.")
+
+@bot.command(name='i')
+async def info(ctx, number: int ):
+    """
+    Shows saved conversations with their links.
+    Usage: 
+    - !i - Shows last 10 saved conversations
+    - !i <number> - Shows specific conversation details
+    """
+    if number is None:
+        # Show last 10 conversations
+        conversations = await database.get_conversations(10)
+        
+        if not conversations:
+            await ctx.send("📭 No saved conversations yet.")
+            return
+        
+        response = "**📚 Saved Conversations:**\n\n"
+        for i, conv in enumerate(conversations, 1):
+            title = conv['title']
+            created_at = conv['created_at']
+            message_link = conv['message_link']
+            
+            response += f"{i}. **{title}**\n"
+            response += f"   *Saved: {created_at}*\n"
+            response += f"   🔗 [Jump to message]({message_link})\n\n"
+        
+        response += "\n💡 Use `!i <number>` to view details (e.g., `!i 1`)"
+        
+        if len(response) > 2000:
+            response = response[:1997] + "..."
+        
+        await ctx.send(response)
+    else:
+        # Show specific conversation
+        conversations = await database.get_conversations(50)
+        
+        if number < 1 or number > len(conversations):
+            await ctx.send(f"❌ Invalid number. Please choose between 1 and {len(conversations)}.")
+            return
+        
+        conv = conversations[number - 1]
+        
+        # Build response
+        title = conv['title']
+        created_at = conv['created_at']
+        message_link = conv['message_link']
+        
+        response = f"**📌 {title}**\n"
+        response += f"*Saved: {created_at}*\n"
+        response += f"🔗 [Jump to message]({message_link})\n"
+        
         await ctx.send(response)
 
 if __name__ == "__main__":
